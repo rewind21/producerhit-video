@@ -1,7 +1,5 @@
 # ============================================================
-# ProducerHit - GitHub Actions FFmpeg
-# Fichier : .github/workflows/ffmpeg.yml
-# Repo    : github.com/TON_USER/producerhit-video
+# ProducerHit - GitHub Actions FFmpeg v3
 # ============================================================
 name: ProducerHit FFmpeg Render
 
@@ -26,7 +24,7 @@ on:
         required: false
         default: "Trouve ton beat sur ProducerHit.com"
       run_id:
-        description: "Identifiant unique du run (ex: ph_2026-05-31_42)"
+        description: "Identifiant unique"
         required: false
         default: "ph_run"
 
@@ -40,81 +38,107 @@ jobs:
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          sudo apt-get install -y ffmpeg fonts-dejavu-core python3
           ffmpeg -version | head -1
 
       # ── 2. Télécharge la vidéo Pollinations ───────────────
       - name: Download Pollinations Video
         run: |
-          echo "Téléchargement vidéo: ${{ inputs.video_url }}"
-          curl -L --max-time 180 --retry 3 --retry-delay 10 \
-            -o source_video.mp4 \
-            "${{ inputs.video_url }}" || echo "VIDEO_FAILED=true" >> $GITHUB_ENV
+          echo "Téléchargement vidéo Seedance..."
+          HTTP_CODE=$(curl -L --max-time 120 --retry 2 \
+            -w "%{http_code}" -o source_video.mp4 \
+            "${{ inputs.video_url }}" 2>/dev/null || echo "000")
           
-          if [ -f source_video.mp4 ] && [ $(stat -c%s source_video.mp4) -gt 50000 ]; then
-            echo "VIDEO_OK=true" >> $GITHUB_ENV
-            echo "Vidéo OK: $(stat -c%s source_video.mp4) bytes"
+          echo "HTTP code: $HTTP_CODE"
+          
+          # Vérifie que c'est vraiment un fichier vidéo valide
+          if [ -f source_video.mp4 ]; then
+            SIZE=$(stat -c%s source_video.mp4 2>/dev/null || echo 0)
+            echo "Taille: $SIZE bytes"
+            
+            # Vérifie avec ffprobe si c'est un vrai MP4
+            if ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_type \
+               -of default=noprint_wrappers=1:nokey=1 source_video.mp4 2>/dev/null | grep -q video; then
+              echo "VIDEO_OK=true" >> $GITHUB_ENV
+              echo "✅ Vidéo Seedance valide"
+            else
+              echo "VIDEO_OK=false" >> $GITHUB_ENV
+              echo "⚠️ Fichier non valide, fallback image"
+              rm -f source_video.mp4
+            fi
           else
             echo "VIDEO_OK=false" >> $GITHUB_ENV
-            echo "Vidéo trop petite ou absente, fallback sur image"
-            # Fallback: télécharge l'image
-            curl -L --max-time 60 --retry 2 \
-              -o source_image.jpg \
-              "${{ inputs.image_url }}"
+            echo "⚠️ Vidéo non téléchargée"
           fi
 
-      # ── 3. Télécharge la musique ───────────────────────────
+      # ── 3. Télécharge image fallback si nécessaire ────────
+      - name: Download Fallback Image
+        if: env.VIDEO_OK != 'true'
+        run: |
+          echo "Téléchargement image fallback..."
+          curl -L --max-time 60 --retry 3 \
+            -o source_image.jpg \
+            "${{ inputs.image_url }}"
+          SIZE=$(stat -c%s source_image.jpg 2>/dev/null || echo 0)
+          echo "Image: $SIZE bytes"
+          if [ "$SIZE" -lt 5000 ]; then
+            echo "❌ Image trop petite"
+            exit 1
+          fi
+
+      # ── 4. Télécharge la musique ───────────────────────────
       - name: Download Music
         run: |
           echo "Téléchargement musique..."
           curl -L --max-time 120 --retry 3 --retry-delay 5 \
             -o music.mp3 \
             "${{ inputs.audio_url }}"
-          echo "Musique: $(stat -c%s music.mp3) bytes"
-          if [ $(stat -c%s music.mp3) -lt 10000 ]; then
-            echo "❌ Musique trop petite, vérifier URL Google Drive"
+          SIZE=$(stat -c%s music.mp3 2>/dev/null || echo 0)
+          echo "Musique: $SIZE bytes"
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "❌ Musique trop petite ou non téléchargée"
+            echo "⚠️ Probablement blocage Google Drive - utilise une URL directe"
             exit 1
           fi
+          echo "✅ Musique OK"
 
-      # ── 4. Render FFmpeg ───────────────────────────────────
+      # ── 5. Render FFmpeg ───────────────────────────────────
       - name: Render Video with FFmpeg
         run: |
           FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
           FONT_N="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-          CTA="${{ inputs.cta }}"
+          # Nettoie le CTA des caractères spéciaux pour drawtext
+          CTA=$(echo "${{ inputs.cta }}" | sed "s/[':]/\\\\ /g" | cut -c1-50)
           TARGET=30
 
           if [ "$VIDEO_OK" = "true" ]; then
             echo "Mode: Vidéo IA Seedance"
-            
-            # Durée de la vidéo source
-            DUR=$(ffprobe -v quiet -show_entries format=duration \
-              -of default=noprint_wrappers=1:nokey=1 source_video.mp4 2>/dev/null || echo "5")
-            LOOPS=$(python3 -c "import math; print(max(1, math.ceil($TARGET / float('$DUR'))))")
-            echo "Durée source: ${DUR}s → ${LOOPS} boucles"
+
+            # Durée sécurisée sans python float
+            DUR_RAW=$(ffprobe -v quiet -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 source_video.mp4 2>/dev/null)
+            echo "Durée brute: '$DUR_RAW'"
+
+            # Calcul loops avec bash pur (évite l'erreur python N/A)
+            if [[ "$DUR_RAW" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+              DUR_INT=$(echo "$DUR_RAW" | cut -d. -f1)
+              if [ "$DUR_INT" -lt 1 ]; then DUR_INT=5; fi
+              LOOPS=$(( ($TARGET + $DUR_INT - 1) / $DUR_INT ))
+            else
+              echo "⚠️ Durée invalide, utilise 5s par défaut"
+              LOOPS=6
+            fi
+            echo "Durée: ${DUR_INT}s → ${LOOPS} boucles"
 
             ffmpeg -y \
               -stream_loop $LOOPS -i source_video.mp4 \
-              -stream_loop -1   -i music.mp3 \
-              -filter_complex "
-                [0:v]scale=1080:1920:force_original_aspect_ratio=decrease,
-                pad=1080:1920:(ow-iw)/2:(oh-ih)/2,
-                setsar=1,
-                drawtext=fontfile='$FONT':
-                  text='ProducerHit.com':
-                  fontsize=56:fontcolor=white:
-                  x=(w-text_w)/2:y=h*0.86:
-                  shadowcolor=black:shadowx=3:shadowy=3:
-                  box=1:boxcolor=black@0.50:boxborderw=14,
-                drawtext=fontfile='$FONT_N':
-                  text='$CTA':
-                  fontsize=34:fontcolor=0xFFD700:
-                  x=(w-text_w)/2:y=h*0.79:
-                  shadowcolor=black:shadowx=2:shadowy=2[vout];
-                [1:a]volume=0.78,
-                  afade=t=in:st=0:d=1.5,
-                  afade=t=out:st=27:d=3[aout]
-              " \
+              -stream_loop -1    -i music.mp3 \
+              -filter_complex "\
+                [0:v]scale=1080:1920:force_original_aspect_ratio=decrease,\
+                pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,\
+                drawtext=fontfile='$FONT':text='ProducerHit.com':fontsize=56:fontcolor=white:x=(w-text_w)/2:y=h*0.86:shadowcolor=black:shadowx=3:shadowy=3:box=1:boxcolor=black@0.5:boxborderw=14,\
+                drawtext=fontfile='$FONT_N':text='$CTA':fontsize=34:fontcolor=0xFFD700:x=(w-text_w)/2:y=h*0.79:shadowcolor=black:shadowx=2:shadowy=2[vout];\
+                [1:a]volume=0.78,afade=t=in:st=0:d=1.5,afade=t=out:st=27:d=3[aout]" \
               -map "[vout]" -map "[aout]" \
               -t $TARGET \
               -c:v libx264 -preset fast -crf 22 -profile:v high \
@@ -126,30 +150,15 @@ jobs:
             echo "Mode: Fallback image fixe + Ken Burns"
 
             ffmpeg -y \
-              -loop 1           -i source_image.jpg \
-              -stream_loop -1   -i music.mp3 \
-              -filter_complex "
-                [0:v]scale=1080:1920,
-                zoompan=z='min(zoom+0.0003,1.12)':
-                  d=900:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920,
-                noise=alls=5:allf=t+u,
-                hue=h='4*sin(t)':s=1.04,
-                vignette=PI/5,
-                drawtext=fontfile='$FONT':
-                  text='ProducerHit.com':
-                  fontsize=56:fontcolor=white:
-                  x=(w-text_w)/2:y=h*0.86:
-                  shadowcolor=black:shadowx=3:shadowy=3:
-                  box=1:boxcolor=black@0.50:boxborderw=14,
-                drawtext=fontfile='$FONT_N':
-                  text='$CTA':
-                  fontsize=34:fontcolor=0xFFD700:
-                  x=(w-text_w)/2:y=h*0.79:
-                  shadowcolor=black:shadowx=2:shadowy=2[vout];
-                [1:a]volume=0.78,
-                  afade=t=in:st=0:d=1.5,
-                  afade=t=out:st=27:d=3[aout]
-              " \
+              -loop 1          -i source_image.jpg \
+              -stream_loop -1  -i music.mp3 \
+              -filter_complex "\
+                [0:v]scale=1080:1920,\
+                zoompan=z='min(zoom+0.0003,1.12)':d=900:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920,\
+                noise=alls=5:allf=t+u,hue=h='4*sin(t)':s=1.04,vignette=PI/5,\
+                drawtext=fontfile='$FONT':text='ProducerHit.com':fontsize=56:fontcolor=white:x=(w-text_w)/2:y=h*0.86:shadowcolor=black:shadowx=3:shadowy=3:box=1:boxcolor=black@0.5:boxborderw=14,\
+                drawtext=fontfile='$FONT_N':text='$CTA':fontsize=34:fontcolor=0xFFD700:x=(w-text_w)/2:y=h*0.79:shadowcolor=black:shadowx=2:shadowy=2[vout];\
+                [1:a]volume=0.78,afade=t=in:st=0:d=1.5,afade=t=out:st=27:d=3[aout]" \
               -map "[vout]" -map "[aout]" \
               -t $TARGET -r 30 \
               -c:v libx264 -preset fast -crf 22 -profile:v high \
@@ -158,10 +167,10 @@ jobs:
               output.mp4
           fi
 
-          echo "✅ Vidéo finale: $(stat -c%s output.mp4) bytes"
+          echo "✅ FFmpeg terminé"
           ls -lh output.mp4
 
-      # ── 5. Upload comme Artifact GitHub ───────────────────
+      # ── 6. Upload Artifact ─────────────────────────────────
       - name: Upload MP4 Artifact
         uses: actions/upload-artifact@v4
         with:
